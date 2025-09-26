@@ -137,6 +137,9 @@ static uint32_t last_applied_color   = 0;
 static uint8_t  last_led_brightness  = 0;
 static float    led_cur_h = 0.0f, led_next_h = 120.0f;
 static uint32_t led_fade_start_ms = 0;
+static uint32_t led_pause_until_ms = 0;
+static uint8_t  led_marquee_index = 0;
+static uint8_t  led_last_lit_pixels = 0;
 
 static void onDataRecv(const uint8_t* mac, const uint8_t* data, int len);
 static void onDataSent(const uint8_t* mac, esp_now_send_status_t status);
@@ -222,6 +225,14 @@ static uint32_t hsvToColor(float h_deg, float s, float v){
 
 static void updateLEDByPos(float pos_cm){
   uint32_t now = millis();
+
+  if (led_pause_until_ms != 0) {
+    if ((int32_t)(now - led_pause_until_ms) < 0) {
+      return; // 仍处于主机握手阶段，保持纯绿色
+    }
+    led_pause_until_ms = 0;
+  }
+
   if (now - last_led_update_ms < LED_UPDATE_MS) return;
   last_led_update_ms = now;
 
@@ -248,16 +259,53 @@ static void updateLEDByPos(float pos_cm){
   if (h < 0.0f) h += 360.0f;
   if (h >= 360.0f) h -= 360.0f;
 
-  uint8_t brightness = mapBrightnessFromPos(pos_cm);
-  uint32_t color = hsvToColor(h, 1.0f, 1.0f);
+  float progress = clampf(pos_cm / MAX_LENGTH_CM, 0.0f, 1.0f);
+  uint8_t pixels_to_light = (uint8_t)clampf(roundf(progress * LED_COUNT), 0.0f, (float)LED_COUNT);
 
-  if (brightness != last_led_brightness || color != last_applied_color){
-    leds.setBrightness(brightness);
-    for (int i=0; i<LED_COUNT; ++i) leds.setPixelColor(i, color);
+  if (pixels_to_light == 0) {
+    leds.clear();
     leds.show();
-    last_led_brightness = brightness;
-    last_applied_color  = color;
+    led_marquee_index = 0;
+    led_last_lit_pixels = 0;
+    last_applied_color = 0;
+    last_led_brightness = 0;
+    return;
   }
+
+  if (pixels_to_light != led_last_lit_pixels) {
+    if (pixels_to_light == 0) {
+      led_marquee_index = 0;
+    } else {
+      led_marquee_index %= pixels_to_light;
+    }
+    led_last_lit_pixels = pixels_to_light;
+  }
+
+  uint8_t brightness = mapBrightnessFromPos(pos_cm);
+  leds.setBrightness(brightness);
+
+  uint32_t base_color = hsvToColor(h, 1.0f, 0.7f);
+  uint8_t base_r = (uint8_t)((base_color >> 16) & 0xFF);
+  uint8_t base_g = (uint8_t)((base_color >> 8) & 0xFF);
+  uint8_t base_b = (uint8_t)(base_color & 0xFF);
+  uint32_t head_color = hsvToColor(h, 1.0f, 1.0f);
+
+  for (uint8_t i = 0; i < LED_COUNT; ++i) {
+    if (i < pixels_to_light) {
+      if (i == led_marquee_index) {
+        leds.setPixelColor(i, head_color);
+      } else {
+        leds.setPixelColor(i, leds.Color(base_r, base_g, base_b));
+      }
+    } else {
+      leds.setPixelColor(i, 0);
+    }
+  }
+
+  leds.show();
+  led_marquee_index = (led_marquee_index + 1) % pixels_to_light;
+  last_led_brightness = brightness;
+  last_applied_color  = base_color;
 }
 
 /* ===== 仅自检用的阻塞移动 ===== */
@@ -323,8 +371,8 @@ static void onDataRecv(const uint8_t* mac, const uint8_t* data, int len){
       leds.setPixelColor(i, leds.Color(0, 255, 0)); // 设置为绿色
     }
     leds.show();
-    // 延迟2秒执行正常的LED更新，以确保绿色状态可见
-    last_led_update_ms = millis() + 2000;
+    led_pause_until_ms = millis() + 2000; // 握手成功后维持绿色2秒
+    led_marquee_index = 0;
   }
 
   if (!master_known){ memcpy(master_mac, mac, 6); if (addMasterPeer(master_mac)) master_known=true; }
