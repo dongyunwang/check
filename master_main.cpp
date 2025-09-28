@@ -42,6 +42,9 @@
 #define CASCADE_TRIGGER_DISTANCE  5.0f   // 级联触发间隔（参考设备每累计位移多少cm触发下一台）
 #define CASCADE_MAX_DISTANCE      19.0f  // 级联最大位移（可与从机最大行程对齐）（当前未使用）
 #define CASCADE_REF_DEVICE        1      // 级联参考设备ID（1~NUM_SLAVES）
+static const uint8_t CASCADE_ORDER[NUM_SLAVES] = {
+  1, 2, 3, 4, 5, 6
+};
 
 #define EXHIBIT_TELE_INTERVAL_MS  200    // 遥测上报请求间隔（毫秒）
 
@@ -132,6 +135,7 @@ struct SlaveState {
 };
 
 static SlaveState slaves[NUM_SLAVES];
+static int cascade_next_idx = 0;
 
 static void onDataRecv(const uint8_t* mac, const uint8_t* data, int len);
 static void onDataSent(const uint8_t* mac, esp_now_send_status_t status);
@@ -191,6 +195,20 @@ static bool checkAllDevicesComplete(){
   for(int i=0;i<NUM_SLAVES;i++)
     if (slaves[i].enabled && !slaves[i].completed) return false;
   return true;
+}
+
+static int findNextCascadeIndex(int start_idx){
+  if (start_idx < 0) start_idx = 0;
+  for (int offset = 0; offset < NUM_SLAVES; ++offset){
+    int idx = (start_idx + offset) % NUM_SLAVES;
+    uint8_t candidate_id = CASCADE_ORDER[idx];
+    if (candidate_id < 1 || candidate_id > NUM_SLAVES) continue;
+    if (candidate_id == CASCADE_REF_DEVICE) continue;
+    if (!isSlaveEnabled(candidate_id)) continue;
+    if (slaves[candidate_id-1].cascade_launched) continue;
+    return idx;
+  }
+  return -1;
 }
 
 static bool initESPNow(){
@@ -332,16 +350,13 @@ static void onDataRecv(const uint8_t* mac, const uint8_t* data, int len){
     if (delta > 0.0f){
       s.accum_distance_cm += delta;
       while (s.accum_distance_cm >= CASCADE_TRIGGER_DISTANCE){
-        bool launched=false;
-        for(int i=0; i<NUM_SLAVES; ++i){
-          if (!slaves[i].enabled || slaves[i].cascade_launched || (i+1)==CASCADE_REF_DEVICE) continue;
-          sendCommand(CMD_START, i+1, DEFAULT_END_CM, 0, 0,
+        int idx = findNextCascadeIndex(cascade_next_idx);
+        if (idx >= 0){
+          uint8_t slave_id = CASCADE_ORDER[idx];
+          sendCommand(CMD_START, slave_id, DEFAULT_END_CM, 0, 0,
                       DEFAULT_SPEED, DEFAULT_ACCEL, TARGET_CYCLES_CASCADE);
-          slaves[i].cascade_launched = true;
-          launched = true;
-          break;
-        }
-        if (launched){
+          slaves[slave_id-1].cascade_launched = true;
+          cascade_next_idx = (idx + 1) % NUM_SLAVES;
           s.accum_distance_cm -= CASCADE_TRIGGER_DISTANCE;
         } else {
           s.accum_distance_cm = fmodf(s.accum_distance_cm, CASCADE_TRIGGER_DISTANCE);
@@ -382,6 +397,20 @@ static void runCascadePhase(){
     slaves[i].accum_distance_cm = 0.0f;
   }
 
+  int ref_idx = -1;
+  for (int i=0; i<NUM_SLAVES; ++i){
+    if (CASCADE_ORDER[i] == CASCADE_REF_DEVICE){
+      ref_idx = i;
+      break;
+    }
+  }
+  if (ref_idx < 0){
+    Serial.printf("[WARN] Reference device %u not found in cascade order, defaulting to ID order.\n", CASCADE_REF_DEVICE);
+    cascade_next_idx = 0;
+  } else {
+    cascade_next_idx = (ref_idx + 1) % NUM_SLAVES;
+  }
+
   // 启动参考设备（模式=0 级联）
   uint32_t seq = sendCommand(CMD_START, CASCADE_REF_DEVICE, DEFAULT_END_CM, DEFAULT_TRIGGER_CM, 0,
                              DEFAULT_SPEED, DEFAULT_ACCEL, TARGET_CYCLES_CASCADE);
@@ -390,6 +419,9 @@ static void runCascadePhase(){
   }
   slaves[CASCADE_REF_DEVICE-1].cascade_launched = true;
   slaves[CASCADE_REF_DEVICE-1].accum_distance_cm = 0.0f;
+
+  int next_idx = findNextCascadeIndex(cascade_next_idx);
+  cascade_next_idx = (next_idx >= 0) ? (next_idx % NUM_SLAVES) : cascade_next_idx;
 
   while (!checkAllDevicesComplete()) {
     delay(100);
