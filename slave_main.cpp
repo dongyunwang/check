@@ -106,6 +106,23 @@ struct __attribute__((packed)) TelemetryMsg {
   uint32_t seq_ack;
 };
 
+enum CommandCode : uint8_t {
+  CMD_START = 1,
+  CMD_STOP  = 2,
+  CMD_PING  = 4,
+  CMD_TEST  = 5,
+  CMD_HOME  = 6
+};
+
+enum TelemetryStatus : uint8_t {
+  TELE_IDLE       = 0,
+  TELE_TRIGGERED  = 4,
+  TELE_LINK_OK    = 5,
+  TELE_HIT_LIMIT  = 8,
+  TELE_TEST_DONE  = 9,
+  TELE_CYCLE_DONE = 10
+};
+
 enum SystemState { STATE_IDLE, STATE_RUNNING, STATE_HOMING_START, STATE_HOMING_TO_LIMIT, STATE_HOMING_TO_READY };
 static SystemState system_state = STATE_IDLE;
 static bool visual_feedback_connected = false;
@@ -155,6 +172,12 @@ static uint8_t getMyID();
 static float generateRandomLength();
 static float generateRandomLengthDifferent(float prev, float min_diff=1.0f);
 
+static uint32_t last_command_seq = 0;
+static bool     last_command_seq_valid = false;
+static uint8_t  last_status_sent = TELE_IDLE;
+
+static bool handleDuplicateCommand(const ControlMsg& c);
+
 static long cmToSteps(float cm){ return -(long)llroundf(cm * STEPS_PER_CM); }
 static float stepsToCm(long steps){ return -(float)steps / STEPS_PER_CM; }
 static float clampf(float x, float lo, float hi){ return (x<lo)?lo:((x>hi)?hi:x); }
@@ -179,6 +202,17 @@ static float generateRandomLengthDifferent(float prev, float min_diff){
   return clampf(v, 3.0f, 19.0f);
 }
 
+static bool handleDuplicateCommand(const ControlMsg& c){
+  if (c.seq == 0) return false;
+  if (last_command_seq_valid && c.seq == last_command_seq){
+    sendTelemetry(last_status_sent, c.seq);
+    return true;
+  }
+  last_command_seq = c.seq;
+  last_command_seq_valid = true;
+  return false;
+}
+
 static bool addMasterPeer(const uint8_t* mac){
   esp_now_peer_info_t p={}; memcpy(p.peer_addr,mac,6);
   p.channel=1; p.encrypt=false; p.ifidx=WIFI_IF_STA;
@@ -187,6 +221,7 @@ static bool addMasterPeer(const uint8_t* mac){
 }
 
 static void sendTelemetry(uint8_t status, uint32_t seq_ack){
+  last_status_sent = status;
   if (!master_known) return;
   TelemetryMsg t;
   t.slave_id = SLAVE_ID;
@@ -332,7 +367,7 @@ static void checkCycleComplete(){
     if (current_cycles >= max_cycles){
       stepper.stop();
       system_state = STATE_IDLE;
-      sendTelemetry(10);
+      sendTelemetry(TELE_CYCLE_DONE);
     }
   }
   at_zero_last = at_zero;
@@ -380,26 +415,38 @@ static void onDataRecv(const uint8_t* mac, const uint8_t* data, int len){
   if (c.speed > 0)  stepper.setMaxSpeed(c.speed);
   if (c.accel > 0)  stepper.setAcceleration(c.accel);
 
+  if (handleDuplicateCommand(c)) return;
+
   switch(c.cmd){
-    case 1: {
+    case CMD_START: {
       end_cm     = clampf(c.end_cm, 0.0f, MAX_LENGTH_CM);
       trigger_cm = clampf(c.trigger_cm, 0.0f, end_cm);
       max_cycles = (c.max_cycles > 0) ? c.max_cycles : TARGET_CYCLES_DEFAULT;
       if (c.mode==0)      startCascade();
       else if (c.mode==1) startRandom();
       else if (c.mode==2) startTest();
+      sendTelemetry(TELE_IDLE, c.seq);
       break;
     }
-    case 2: {
+    case CMD_STOP: {
       stepper.stop(); system_state=STATE_IDLE;
       current_cycles = 0; outward_reached_min=false; at_zero_last=false; random_going_out = true;
-      sendTelemetry(0);
+      sendTelemetry(TELE_IDLE, c.seq);
       break;
     }
-    case 4: { sendTelemetry(5, c.seq); break; } // Ping请求
-    case 5: { startTest(); break; }             // 测试
-    case 6: {                                   // 归位
+    case CMD_PING: { sendTelemetry(TELE_LINK_OK, c.seq); break; }
+    case CMD_TEST: {
+      startTest();
+      sendTelemetry(TELE_IDLE, c.seq);
+      break;
+    }
+    case CMD_HOME: {
       stepper.stop(); system_state = STATE_HOMING_START;
+      sendTelemetry(TELE_IDLE, c.seq);
+      break;
+    }
+    default: {
+      sendTelemetry(last_status_sent, c.seq);
       break;
     }
   }
@@ -410,6 +457,10 @@ static void onDataSent(const uint8_t* mac, esp_now_send_status_t status){}
 void setup(){
   WiFi.mode(WIFI_STA); WiFi.disconnect(); esp_wifi_set_ps(WIFI_PS_NONE);
   esp_wifi_set_promiscuous(true); esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE); esp_wifi_set_promiscuous(false);
+
+  last_command_seq = 0;
+  last_command_seq_valid = false;
+  last_status_sent = TELE_IDLE;
 
   pinMode(ENABLE_PIN1, OUTPUT); pinMode(ENABLE_PIN2, OUTPUT);
   digitalWrite(ENABLE_PIN1, LOW);           // ← 如驱动接法不同可对调
@@ -464,7 +515,7 @@ void loop(){
         stepper.stop();
         stepper.setCurrentPosition(0);
         delay(50);
-        sendTelemetry(8);                 // 碰到限位
+        sendTelemetry(TELE_HIT_LIMIT);                 // 碰到限位
         stepper.setMaxSpeed(WORK_SPEED);
         stepper.setAcceleration(WORK_ACCEL);
         stepper.moveTo(cmToSteps(READY_POS_CM));
@@ -474,7 +525,7 @@ void loop(){
 
     case STATE_HOMING_TO_READY:
       if (stepper.distanceToGo() == 0) {
-        sendTelemetry(0);                 // 空闲
+        sendTelemetry(TELE_IDLE);                 // 空闲
         system_state = STATE_IDLE;
       }
       break;
@@ -489,7 +540,7 @@ void loop(){
         if (run_mode==0){ // 级联
           if (moving_forward){ moving_forward=false; stepper.moveTo(0); }
           else { moving_forward=true; trigger_reported=false; stepper.moveTo(cmToSteps(end_cm)); }
-          sendTelemetry(0);
+          sendTelemetry(TELE_IDLE);
         }
         else if (run_mode==1){ // 随机
           if (random_going_out) {
@@ -499,20 +550,20 @@ void loop(){
             current_cycles++;
             if (current_cycles >= max_cycles){
               stepper.stop(); system_state = STATE_IDLE;
-              sendTelemetry(10);
+              sendTelemetry(TELE_CYCLE_DONE);
             } else {
               random_target_cm = generateRandomLengthDifferent(random_target_cm, 1.0f);
               random_going_out = true;
               stepper.setMaxSpeed(WORK_SPEED);
               stepper.setAcceleration(WORK_ACCEL);
               stepper.moveTo(cmToSteps(random_target_cm));
-              sendTelemetry(0);
+              sendTelemetry(TELE_IDLE);
             }
           }
         }
         else if (run_mode==2){ // 测试
           if (stepper.currentPosition()==cmToSteps(MAX_LENGTH_CM)){ stepper.moveTo(0); }
-          else if (stepper.currentPosition()==0){ system_state=STATE_IDLE; sendTelemetry(9); }
+          else if (stepper.currentPosition()==0){ system_state=STATE_IDLE; sendTelemetry(TELE_TEST_DONE); }
         }
       }
       break;
@@ -522,10 +573,10 @@ void loop(){
 
   if (system_state == STATE_RUNNING) {
     uint32_t now=millis();
-    if (now-last_tele_ms>=g_tele_ms){ sendTelemetry(5); last_tele_ms=now; }
+    if (now-last_tele_ms>=g_tele_ms){ sendTelemetry(TELE_LINK_OK); last_tele_ms=now; }
     if (run_mode==0 && moving_forward && !trigger_reported){
       float p=stepsToCm(stepper.currentPosition());
-      if (p>=trigger_cm){ trigger_reported=true; sendTelemetry(4); }
+      if (p>=trigger_cm){ trigger_reported=true; sendTelemetry(TELE_TRIGGERED); }
     }
   }
 }
