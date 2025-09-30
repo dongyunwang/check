@@ -406,6 +406,19 @@ static void onDataRecv(const uint8_t* mac, const uint8_t* data, int len){
 }
 static void onDataSent(const uint8_t* mac, esp_now_send_status_t status){}
 
+// 步进电机控制任务，将运行在核心0上
+void stepperTask(void *pvParameters) {
+  // Serial.println("Stepper task started on core 0"); // 调试时可取消注释
+  for (;;) { // 无限循环
+    // 持续调用 stepper.run()，这是唯一需要做的事
+    stepper.run();
+
+    // 给予其他在核心0上运行的低优先级任务（如WiFi）一点点时间
+    // vTaskDelay(1) 会让出CPU至少1个tick（通常是1ms）
+    vTaskDelay(1); 
+  }
+}
+
 /* ===== 初始化 ===== */
 void setup(){
   WiFi.mode(WIFI_STA); WiFi.disconnect(); esp_wifi_set_ps(WIFI_PS_NONE);
@@ -432,6 +445,17 @@ void setup(){
   esp_now_register_send_cb(onDataSent);
 
   system_state = STATE_IDLE;  // 上电后保持静默，等待主机指令
+
+  // 创建并启动步进电机任务，并将其“钉”在核心0上
+  xTaskCreatePinnedToCore(
+      stepperTask,      // 1. 要运行的函数
+      "StepperTask",    // 2. 任务名（用于调试）
+      4096,             // 3. 任务的堆栈大小（字节）
+      NULL,             // 4. 传递给任务的参数（这里不需要）
+      1,                // 5. 任务优先级（0是最低，数字越大优先级越高）
+      NULL,             // 6. 任务句柄（这里不需要）
+      0                 // 7. 钉在哪个核心上（0或1）。我们将它钉在核心0
+  );
 }
 
 /* ===== 主循环 ===== */
@@ -518,7 +542,7 @@ void loop(){
       break;
   }
 
-  if (system_state != STATE_IDLE) stepper.run();
+  // if (system_state != STATE_IDLE) stepper.run(); // 此行已由后台任务取代，必须移除
 
   if (system_state == STATE_RUNNING) {
     uint32_t now=millis();
